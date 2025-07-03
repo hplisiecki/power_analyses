@@ -17,7 +17,7 @@ alpha = 0.05             # Type I error rate
 
 
 # 2. Simulation settings
-Ns = np.arange(1000, 2001, 200)  # sample sizes to sweep
+Ns = np.arange(1000, 3001, 200)  # sample sizes to sweep
 B = 100  # Monte Carlo replicates per N
 
 
@@ -106,5 +106,11 @@ plt.legend()
 plt.grid(True)
 plt.ylim(0, 1)
 plt.show()
+
+# save plot
+plt.savefig("power_curves_study1.png", dpi=300, bbox_inches='tight')
+
+# save
+df_power.to_csv("power_estimates_study1.csv", index=False)
 
 # df_power contains the numeric power by N for each hypothesis
