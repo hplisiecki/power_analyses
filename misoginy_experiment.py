@@ -1,116 +1,140 @@
 import numpy as np
 import pandas as pd
-import statsmodels.formula.api as smf
 import matplotlib.pyplot as plt
+from statsmodels.formula.api import mixedlm
+from scipy import stats
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 
-# Monte Carlo power simulation for H1–H4 in Study 1
-
-# 1. Parameters
-sigma_u = 1.5            # variability of participants’ random intercepts
-sigma_e = 2.0            # residual (within-cell) noise
-beta0   = 5.0            # overall intercept
-beta_content = -0.2      # true “small” content effect for H1
-beta_h2      = -0.2      # extra drop for male→male (H2 and H3)
-beta_h4      = +0.2      # boost for male→female (H4)
-alpha = 0.05             # Type I error rate
+# Ensure a spawn start method for compatibility
+multiprocessing.set_start_method('spawn', force=True)
 
 
-# 2. Simulation settings
-Ns = np.arange(1000, 3001, 200)  # sample sizes to sweep
-B = 100  # Monte Carlo replicates per N
+# --- Simulation & Testing Functions (pickleable at module level) ---
 
+def simulate_dataset(n_per_cond, tau, sigma, d, seed):
+    np.random.seed(seed)
+    conds = ['SM', 'SF', 'NM', 'NF']
+    partners = ['male', 'female', 'neutral']
+    N = n_per_cond * len(conds)
 
-# 3. Helper: simulate one dataset of size N
-def simulate_dataset(N):
-    # build design grid
-    rows = []
-    for pid in range(N):
-        for content in ['neutral', 'stereotypical']:
-            for author in ['female', 'male']:
-                for partner in ['neutral', 'female', 'male']:
-                    rows.append((pid, content, author, partner))
-    df = pd.DataFrame(rows, columns=['participant', 'content', 'author', 'partner'])
+    subjects = pd.DataFrame({
+        'subj': np.arange(N),
+        'cond': np.repeat(conds, n_per_cond)
+    })
+    subjects['b0'] = np.random.normal(0, tau, size=N)
 
-    # random intercepts
-    u = np.random.normal(0, sigma_u, size=N)
-    df['u'] = df['participant'].map(dict(enumerate(u)))
+    df = subjects.merge(pd.DataFrame({'partner': partners}), how='cross')
+    fe = np.zeros(len(df))
 
-    # fixed effects
-    fe = beta0
-    fe_arr = np.full(len(df), beta0)
-    fe_arr += (df['content'] == 'stereotypical') * beta_content
-    fe_arr += ((df['content'] == 'stereotypical') &
-               (df['author'] == 'male') &
-               (df['partner'] == 'male')) * beta_h2
-    fe_arr += ((df['content'] == 'stereotypical') &
-               (df['author'] == 'male') &
-               (df['partner'] == 'female')) * beta_h4
+    # H1: stereotype comment ↓ neutral-partner trust
+    fe[(df.partner == 'neutral') & df.cond.isin(['SM', 'SF'])] -= d
+    # H2: SM comment ↓ male-partner trust
+    fe[(df.partner == 'male') & (df.cond == 'SM')] -= d
+    # H3: SF comment on female-partner ↑ (relative coding)
+    fe[(df.partner == 'female') & (df.cond == 'SF')] += d
+    # H4: SM comment ↑ female-partner trust
+    fe[(df.partner == 'female') & (df.cond == 'SM')] += d
 
-    # simulate outcome
-    eps = np.random.normal(0, sigma_e, size=len(df))
-    df['amount'] = fe_arr + df['u'] + eps
-
-    # cast factors
-    df['content'] = df['content'].astype('category')
-    df['author'] = df['author'].astype('category')
-    df['partner'] = df['partner'].astype('category')
-
+    df['y'] = df.b0 + fe + np.random.normal(0, sigma, size=len(df))
     return df
 
 
-# 4. Run Monte Carlo
-results = []
-for N in Ns:
-    print(f"Running simulations for N={N}...")
-    rejects = {'H1': 0, 'H2': 0, 'H3': 0, 'H4': 0}
-    for _ in tqdm(range(B)):
-        df = simulate_dataset(N)
-        model = smf.mixedlm("amount ~ content * author * partner",
-                            groups="participant", data=df)
-        fit = model.fit(reml=False)
-        p = fit.pvalues
+def fit_and_test(df):
+    md = mixedlm("y ~ C(cond)*C(partner)", df, groups=df["subj"])
+    mdf = md.fit(reml=False, disp=False)
+    params = mdf.params
+    cov = mdf.cov_params()
+    cols = params.index.tolist()
 
-        # H1
-        if p.get('content[T.stereotypical]', 1) < alpha:
-            rejects['H1'] += 1
-        # H2 & H3: same 3-way term
-        key_h2 = 'content[T.stereotypical]:author[T.male]:partner[T.male]'
-        if p.get(key_h2, 1) < alpha:
-            rejects['H2'] += 1
-            rejects['H3'] += 1
-        # H4
-        key_h4 = 'content[T.stereotypical]:author[T.male]'
-        if p.get(key_h4, 1) < alpha:
-            rejects['H4'] += 1
+    def contrast(vec):
+        est = vec.dot(params)
+        se = np.sqrt(vec @ cov @ vec)
+        z = est / se
+        return 2 * (1 - stats.norm.cdf(abs(z)))
 
-    # collect power estimates
-    results.append({
-        'N': N,
-        'Power_H1': rejects['H1'] / B,
-        'Power_H2': rejects['H2'] / B,
-        'Power_H3': rejects['H3'] / B,
-        'Power_H4': rejects['H4'] / B,
-    })
+    def make_vec(cond, partner, w=1.0):
+        v = np.zeros(len(cols))
+        v[cols.index('Intercept')] = 1
+        c_name = f"C(cond)[T.{cond}]"
+        p_name = f"C(partner)[T.{partner}]"
+        i_name = f"{c_name}:{p_name}"
+        for name in (c_name, p_name, i_name):
+            if name in cols:
+                v[cols.index(name)] = 1
+        return w * v
 
-df_power = pd.DataFrame(results)
+    c1 = (make_vec('SM', 'neutral', .5) + make_vec('SF', 'neutral', .5)
+          - make_vec('NM', 'neutral', .5) - make_vec('NF', 'neutral', .5))
+    c2 = (make_vec('SM', 'male', 1) +
+          sum(make_vec(c, 'male', -1 / 3) for c in ['SF', 'NM', 'NF']))
+    c3 = make_vec('SM', 'male', 1) - make_vec('SF', 'female', 1)
+    c4 = make_vec('SM', 'female', 1) - make_vec('SM', 'male', 1)
 
-# 5. Plot
-plt.figure(figsize=(8, 5))
-for h in ['H1', 'H2', 'H3', 'H4']:
-    plt.plot(df_power['N'], df_power[f'Power_{h}'], marker='o', label=h)
-plt.xlabel("Number of Participants")
-plt.ylabel("Estimated Power")
-plt.title("Monte Carlo Power Curves for H1–H4")
-plt.legend()
-plt.grid(True)
-plt.ylim(0, 1)
-plt.show()
+    return {
+        'H1': contrast(c1),
+        'H2': contrast(c2),
+        'H3': contrast(c3),
+        'H4': contrast(c4),
+    }
 
-# save plot
-plt.savefig("power_curves_study1.png", dpi=300, bbox_inches='tight')
 
-# save
-df_power.to_csv("power_estimates_study1.csv", index=False)
+def _single_sim(args):
+    return fit_and_test(simulate_dataset(*args))
 
-# df_power contains the numeric power by N for each hypothesis
+
+def estimate_power_parallel(n_per_cond, sims, alpha, tau, sigma, d, workers=None):
+    seeds = np.random.randint(0, 1e8, size=sims)
+    args = [(n_per_cond, tau, sigma, d, s) for s in seeds]
+    counts = {'H1': 0, 'H2': 0, 'H3': 0, 'H4': 0}
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        for res in tqdm(executor.map(_single_sim, args), total=sims, desc=f"Npc={n_per_cond}"):
+            for h, p in res.items():
+                if p < alpha:
+                    counts[h] += 1
+
+    return {h: counts[h] / sims for h in counts}
+
+
+def main():
+    total_range = range(100, 1501, 100)
+    power_data = []
+
+    for total in total_range:
+        n_per_cond = total // 4
+        pw = estimate_power_parallel(
+            n_per_cond=n_per_cond,
+            sims=1000,
+            alpha=0.05,
+            tau=0.5,
+            sigma=1.0,
+            d=0.2
+        )
+        pw['total'] = total
+        power_data.append(pw)
+
+    df_pw = pd.DataFrame(power_data)
+
+    # Plot power curves
+    plt.figure()
+    for h in ['H1', 'H2', 'H3', 'H4']:
+        plt.plot(df_pw['total'], df_pw[h], label=h)
+    plt.axhline(0.8, linestyle='--')
+    plt.xlabel('Total sample size')
+    plt.ylabel('Power')
+    plt.title('Power vs. Total N')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Print minimum N achieving ≥80% across all hypotheses
+    meets = df_pw[df_pw[['H1', 'H2', 'H3', 'H4']].ge(0.8).all(axis=1)]
+    print("Minimum total N with ≥80% power for all hypotheses:", meets.total.min())
+
+# Minimum total N with ≥80% power for all hypotheses: 1300
+
+if __name__ == "__main__":
+    main()
+
